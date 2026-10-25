@@ -732,6 +732,52 @@ curl http://127.0.0.1:31889/v1/chat/completions \
   }'
 ```
 
+### Qwen3.5-0.8B on one Ascend NPU
+
+Qwen3.5-0.8B combines 18 GDN layers with 6 full-attention layers. The Ascend
+GDN path keeps recurrent state in FP32, while the 256-wide full-attention heads
+use the NPU matmul fallback described in `tokenspeed-kernel-npu/README.md`.
+This correctness-oriented configuration uses eager execution and greedy output:
+
+```bash
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0
+export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}"
+python -m tokenspeed.cli serve /path/to/Qwen3.5-0.8B \
+  --served-model-name qwen3.5-0.8b --device npu --dtype bfloat16 \
+  --kv-cache-dtype auto --attention-backend mha \
+  --mm-attention-backend triton_attn --sampling-backend greedy \
+  --disable-prefill-graph --disable-pdl --enforce-eager --disable-autotune \
+  --disable-prefix-caching --disable-kvstore \
+  --max-model-len 4096 --max-num-seqs 1 --max-total-tokens 16384 \
+  --chunked-prefill-size 512 --prefix-granularity 128 \
+  --max-cudagraph-capture-size 1 --cudagraph-capture-sizes 1 \
+  --host 127.0.0.1 --port 31957
+```
+
+The recipe covers text and image chat requests with BF16 vision attention.
+The Qwen3.5 vision tower reuses the Triton noncausal attention backend. Image
+features are released after their final prefill chunk, using the tensor's own
+device module to record the consuming stream (including NPU streams).
+
+Image validation uses deterministic color/shape fixtures at 256 x 256,
+384 x 256, 512 x 512, and 1024 x 1024, plus two images in both orders and an
+A-B-A request sequence. The largest fixture contributes 1024 image tokens,
+so its embeddings span multiple 512-token prefill chunks. Use the checkpoint
+chat template with `enable_thinking=False` and matching stop token IDs when
+comparing chat output with Transformers.
+
+Run the NPU GDN, convolution, gated RMSNorm, and 256-wide MHA tests under
+`tokenspeed-kernel/test/npu/ops/`, plus
+`test/runtime/models/test_vision_stream_ascend.py`. Compare encoder numerics
+separately from decoded text: the learned vision tower amplifies BF16 rounding
+and attention-backend differences, so matching short answers does not imply
+close per-element BF16 features. FP32 arithmetic checks with the same weights
+and BF16-rounded pixels isolate this effect; the BF16 deviations must still
+be reported. Video-file ingestion, concurrent requests, and graph execution
+are outside this recipe's validated scope. The unfused GDN scan synchronizes
+for sequence boundaries and remains the main prefill optimization target.
+
 ```bash
 tokenspeed serve Qwen/Qwen3-30B-A3B \
   --served-model-name qwen3-30b-a3b \

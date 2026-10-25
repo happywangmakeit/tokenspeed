@@ -1,5 +1,14 @@
 # Beam layernorm kernels
 
+## Ascend Qwen3.5 gated RMSNorm
+
+The Ascend `gated_rmsnorm` registry implementation computes grouped RMS
+statistics in FP32, then applies the model's learned weight and either SiLU or
+sigmoid gate. It supports both gate-before-norm and norm-before-gate, shared or
+per-group weights, and empty rows. The current path returns BF16/FP16/FP32;
+FP8 output is not supported. `test/npu/ops/test_gated_rmsnorm_ascend.py`
+compares the public operator with an independent CPU FP32 reference.
+
 Beam calls two of its norm kernels directly (`tokenspeed/runtime/models/beam.py`):
 
 - the residual boundary: `triton.rmsnorm(x, weight, eps, residual=residual,

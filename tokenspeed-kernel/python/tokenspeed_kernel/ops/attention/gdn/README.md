@@ -55,3 +55,16 @@ masked during loading. Aligned state accesses are vectorized, with fallbacks
 for unaligned rows and arbitrary row strides. Batch size, window length, and
 payload layer stride remain runtime scalars, so serving shape changes reuse
 the compiled kernel.
+
+## Ascend correctness path
+
+`ascend_gdn_chunk_prefill` and `ascend_gdn_decode_step` implement the
+Qwen3.5 GDN recurrence with PyTorch NPU operators. The input and output state
+layout is K-last `[page, value_head, value_dim, key_dim]`, and the scan uses
+float32 for Q/K normalization, decay, and state updates. The prefill path
+copies only sequence boundaries to the host, which synchronizes the device;
+the decode path copies state-page indices to the host. This path establishes
+correctness but has per-token Python dispatch and host synchronization costs.
+It supports one-token decode and ordinary prefill, not speculative verification
+or intermediate state checkpoints. `test/npu/ops/test_gdn_ascend.py` compares
+short, ragged, and padded cases with the Transformers float32 reference.

@@ -21,10 +21,61 @@
 """Ascend layernorm kernels."""
 
 import torch
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel_npu.ops.layernorm import qk_rmsnorm as _npu_qk_rmsnorm
 from tokenspeed_kernel_npu.ops.layernorm import rmsnorm
 
-__all__ = ["qk_rmsnorm", "rmsnorm"]
+__all__ = ["gated_rmsnorm", "qk_rmsnorm", "rmsnorm"]
+
+
+@register_kernel(
+    "layernorm",
+    "gated_rmsnorm",
+    name="ascend_gated_rmsnorm",
+    solution="ascend",
+    capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    priority=Priority.PORTABLE + 1,
+    traits={"fp8_out": frozenset({False})},
+)
+def gated_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    z: torch.Tensor | None,
+    eps: float,
+    group_size: int,
+    norm_before_gate: bool,
+    sigmoid_gate: bool,
+    fp8_scale: torch.Tensor | None,
+    weights_independent: bool,
+) -> torch.Tensor:
+    """NPU reference path with FP32 accumulation and grouped statistics."""
+    del weights_independent
+    if fp8_scale is not None:
+        raise ValueError("Ascend gated RMSNorm does not support FP8 output")
+    width = x.shape[-1]
+    if width % group_size:
+        raise ValueError("group_size must divide the final dimension")
+    if weight.numel() not in (width, group_size):
+        raise ValueError("weight must have width or group_size elements")
+    values = x.float().reshape(*x.shape[:-1], width // group_size, group_size)
+    if z is not None:
+        gate = torch.sigmoid(z.float())
+        if not sigmoid_gate:
+            gate = gate * z.float()
+        gate = gate.reshape_as(values)
+        if not norm_before_gate:
+            values = values * gate
+    variance = values.square().mean(dim=-1, keepdim=True)
+    result = values * torch.rsqrt(variance + eps)
+    result = result * weight.float().reshape(-1, group_size)
+    if z is not None and norm_before_gate:
+        result = result * gate
+    return result.reshape_as(x).to(x.dtype)
 
 
 def qk_rmsnorm(

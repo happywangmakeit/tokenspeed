@@ -7,6 +7,14 @@ AMD package layout and keeps the TokenSpeed runtime vendor-neutral.
 The initial Ascend path provides paged MHA, RMSNorm, Q/K RMSNorm, rotary
 embedding, and the Triton-Ascend import adapter required by CANN 9.0.0.
 
+For Qwen3.5 text inference, ACL's TND fused attention rejects the model's
+256-wide query/key/value heads. The MHA operator therefore uses an NPU
+matmul/softmax path at head dimension 256 for variable-length prefill, paged
+cache extension, and single-token decode. It computes scores in FP32 and
+preserves causal position offsets across cache pages. Other head dimensions
+continue to use ACL fused attention. This path favors correctness; host reads
+of sequence lengths and unfused attention make it a performance target.
+
 For development from this repository:
 
 ```bash

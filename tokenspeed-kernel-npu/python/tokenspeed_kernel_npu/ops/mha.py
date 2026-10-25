@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 
 import torch
@@ -61,6 +62,52 @@ def _check_options(
         raise NotImplementedError("Ascend MHA does not return LSE")
 
 
+def _mha_256_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    query_start: int,
+    causal: bool,
+) -> torch.Tensor:
+    """Correctness path for head_dim=256, unsupported by ACL TND attention."""
+    if q.shape[0] == 0:
+        return torch.empty_like(q)
+    if k.shape[0] == 0:
+        return torch.zeros_like(q)
+    if q.shape[1] % k.shape[1]:
+        raise ValueError("query heads must be divisible by KV heads")
+    repeats = q.shape[1] // k.shape[1]
+    k = k.repeat_interleave(repeats, dim=1)
+    v = v.repeat_interleave(repeats, dim=1)
+    scores = (
+        torch.matmul(
+            q.transpose(0, 1).float(), k.transpose(0, 1).float().transpose(-1, -2)
+        )
+        * scale
+    )
+    if causal:
+        query_positions = query_start + torch.arange(q.shape[0], device=q.device)
+        key_positions = torch.arange(k.shape[0], device=q.device)
+        scores = scores.masked_fill(
+            key_positions[None, None, :] > query_positions[None, :, None],
+            float("-inf"),
+        )
+    probabilities = torch.softmax(scores, dim=-1)
+    output = torch.matmul(probabilities, v.transpose(0, 1).float())
+    return output.transpose(0, 1).to(q.dtype)
+
+
+def _read_paged_kv(
+    cache: torch.Tensor, page_table: torch.Tensor, row: int, length: int
+) -> torch.Tensor:
+    page_size = cache.shape[1]
+    n_pages = (length + page_size - 1) // page_size
+    pages = page_table[row, :n_pages].long()
+    return cache.index_select(0, pages).flatten(0, 1)[:length]
+
+
 def mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -82,6 +129,20 @@ def mha_prefill(
         sinks=sinks,
         return_lse=return_lse,
     )
+    if q.shape[-1] == 256:
+        chunks = []
+        for start, end in itertools.pairwise(cu_seqlens_cpu):
+            chunks.append(
+                _mha_256_reference(
+                    q[start:end],
+                    k[start:end],
+                    v[start:end],
+                    scale=_scale(q, softmax_scale),
+                    query_start=0,
+                    causal=True,
+                )
+            )
+        return torch.cat(chunks, dim=0)
     output, _ = torch_npu.npu_fused_infer_attention_score(
         q,
         k,
@@ -129,6 +190,26 @@ def mha_extend_with_kvcache(
     )
     if q_scale is not None or k_scale is not None or v_scale is not None:
         raise NotImplementedError("Ascend MHA does not support scaled FP8 cache")
+
+    if q.shape[-1] == 256:
+        q_bounds = cu_seqlens_q.to("cpu").tolist()
+        lengths = cache_seqlens.to("cpu").tolist()
+        chunks = []
+        for row, (start, end) in enumerate(itertools.pairwise(q_bounds)):
+            length = int(lengths[row])
+            keys = _read_paged_kv(k_cache, page_table, row, length)
+            values = _read_paged_kv(v_cache, page_table, row, length)
+            chunks.append(
+                _mha_256_reference(
+                    q[start:end],
+                    keys,
+                    values,
+                    scale=_scale(q, softmax_scale),
+                    query_start=length - (end - start),
+                    causal=is_causal,
+                )
+            )
+        return torch.cat(chunks, dim=0)
 
     output, _ = torch_npu.npu_fused_infer_attention_score(
         q,
@@ -179,6 +260,26 @@ def mha_decode_with_kvcache(
         raise NotImplementedError("Ascend MHA does not support scaled FP8 cache")
 
     del max_seqlen_k, enable_pdl
+    if q.shape[-1] == 256:
+        lengths = cache_seqlens.to("cpu").tolist()
+        chunks = []
+        for row, length in enumerate(lengths):
+            if length <= 0:
+                chunks.append(torch.zeros_like(q[row : row + 1]))
+                continue
+            keys = _read_paged_kv(k_cache, page_table, row, int(length))
+            values = _read_paged_kv(v_cache, page_table, row, int(length))
+            chunks.append(
+                _mha_256_reference(
+                    q[row : row + 1],
+                    keys,
+                    values,
+                    scale=_scale(q, softmax_scale),
+                    query_start=length - 1,
+                    causal=False,
+                )
+            )
+        return torch.cat(chunks, dim=0)
     batch_size = cache_seqlens.shape[0]
     actual_seq_lengths_kv = (
         [1] * batch_size if torch.npu.is_current_stream_capturing() else cache_seqlens
