@@ -3966,6 +3966,7 @@ class ServerArgs:
 
         # Multimodal
         mm_attention_backend_choices = [
+            "torch_eager",
             "fa3",
             "fa4",
             "triton_attn",

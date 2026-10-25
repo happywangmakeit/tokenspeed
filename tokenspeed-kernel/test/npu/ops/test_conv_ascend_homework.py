@@ -33,10 +33,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("tokens", [1, 7])
-def test_causal_conv_prefill_and_decode_state(tokens):
+@pytest.mark.parametrize("channels", [32, 6144])
+@pytest.mark.parametrize("tokens", [1, 7, 16, 256])
+def test_causal_conv_prefill_and_decode_state(tokens, channels):
     torch.manual_seed(31)
-    width, channels = 4, 32
+    width = 4
     rows = torch.randn(tokens, channels, dtype=torch.bfloat16, device="npu") / 8
     weight = torch.randn(channels, width, dtype=torch.bfloat16, device="npu") / 8
     conv_state = torch.zeros(2, channels, width - 1, dtype=torch.bfloat16, device="npu")

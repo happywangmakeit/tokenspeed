@@ -746,7 +746,7 @@ export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspe
 python -m tokenspeed.cli serve /path/to/Qwen3.5-0.8B \
   --served-model-name qwen3.5-0.8b --device npu --dtype bfloat16 \
   --kv-cache-dtype auto --attention-backend mha \
-  --mm-attention-backend triton_attn --sampling-backend greedy \
+  --mm-attention-backend torch_eager --sampling-backend greedy \
   --disable-prefill-graph --disable-pdl --enforce-eager --disable-autotune \
   --disable-prefix-caching --disable-kvstore \
   --max-model-len 4096 --max-num-seqs 1 --max-total-tokens 16384 \
@@ -756,7 +756,7 @@ python -m tokenspeed.cli serve /path/to/Qwen3.5-0.8B \
 ```
 
 The recipe covers text and image chat requests with BF16 vision attention.
-The Qwen3.5 vision tower reuses the Triton noncausal attention backend. Image
+The Qwen3.5 vision tower uses registry-dispatched PyTorch eager noncausal attention. It preserves BF16 QK/softmax rounding boundaries to match the official eager reference, at the cost of materializing quadratic score matrices and reading sequence boundaries on the host. Position interpolation reduces all packed corners in FP32 before casting; RoPE uses CPU FP32 inverse-frequency constants and device FP32 trigonometry. Image
 features are released after their final prefill chunk, using the tensor's own
 device module to record the consuming stream (including NPU streams).
 
@@ -773,8 +773,7 @@ Run the NPU GDN, convolution, gated RMSNorm, and 256-wide MHA tests under
 separately from decoded text: the learned vision tower amplifies BF16 rounding
 and attention-backend differences, so matching short answers does not imply
 close per-element BF16 features. FP32 arithmetic checks with the same weights
-and BF16-rounded pixels isolate this effect; the BF16 deviations must still
-be reported. Video-file ingestion, concurrent requests, and graph execution
+and BF16-rounded pixels isolate this effect; both BF16 and FP32 comparisons must pass independently. The previous Triton baseline has different BF16 rounding and must not be confused with this eager configuration. Real-shape GDN tests cover 16 heads of width 128, split prefill and eight decode updates; convolution tests cover 6144 channels. Additional vision tests cover packed and temporal grids. Video-file ingestion, concurrent requests, and graph execution
 are outside this recipe's validated scope. The unfused GDN scan synchronizes
 for sequence boundaries and remains the main prefill optimization target.
 

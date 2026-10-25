@@ -43,7 +43,6 @@ from tokenspeed.runtime.layers.attention.mm_encoder_attention import (
 from tokenspeed.runtime.layers.conv import Conv3dLayer
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.utils import add_prefix
@@ -310,13 +309,15 @@ class Qwen3VLMoeVisionModel(nn.Module):
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
-        self.rotary_pos_emb = get_rope(
-            head_size=head_dim,
-            rotary_dim=head_dim // 2,
-            max_position=8192,
-            base=10000.0,
-            is_neox_style=True,
-        )
+        # Match the reference's CPU FP32 inverse frequencies. Keep constants
+        # outside dtype-converted model buffers; evaluate trig on the device.
+        rotary_dim = head_dim // 2
+        with torch.device("cpu"):
+            inv_freq = 1.0 / (
+                10000.0
+                ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+            )
+        self.rotary_inv_freq = tuple(inv_freq.tolist())
 
         workspace_buffer = None
         if self.mm_attention_backend == "flashinfer_cudnn":
@@ -464,15 +465,18 @@ class Qwen3VLMoeVisionModel(nn.Module):
         return cos_combined, sin_combined
 
     def _get_rotary_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.rotary_pos_emb.cos_sin_cache[:seqlen].to(self.device)
-        return cos_sin.chunk(2, dim=-1)
+        inv_freq = torch.tensor(
+            self.rotary_inv_freq, device=self.device, dtype=torch.float32
+        )
+        positions = torch.arange(seqlen, device=self.device, dtype=torch.float32)
+        frequencies = positions[:, None] * inv_freq[None, :]
+        return frequencies.cos(), frequencies.sin()
 
     def fast_pos_embed_interpolate_from_list(self, grid_thw):
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
-        hidden_dim = self.pos_embed.embedding_dim
-
-        outputs = []
+        index_parts = []
+        weight_parts = []
         for t, h, w in grid_thw:
             h_idxs = torch.linspace(
                 0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
@@ -494,17 +498,12 @@ class Qwen3VLMoeVisionModel(nn.Module):
             h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
             h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
 
-            # original computation of weights
-            # w00 = (1 - dh_grid) * (1 - dw_grid)
-            # w01 = (1 - dh_grid) * dw_grid
-            # w10 = dh_grid * (1 - dw_grid)
-            # w11 = dh_grid * dw_grid
-            # we reuse w11 here to avoid duplicate
-            # dh_grid * dw_grid computation
+            # Retain FP32 interpolation products until the final reduction.
+            # Rounding weights or each corner to BF16 changes the tower input.
+            w00 = (1 - dh_grid) * (1 - dw_grid)
+            w01 = (1 - dh_grid) * dw_grid
+            w10 = dh_grid * (1 - dw_grid)
             w11 = dh_grid * dw_grid
-            w10 = dh_grid - w11
-            w01 = dw_grid - w11
-            w00 = 1 - dh_grid - w01
 
             h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
             w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
@@ -512,20 +511,22 @@ class Qwen3VLMoeVisionModel(nn.Module):
 
             indices = (h_grid_idx + w_grid).reshape(4, -1)
             weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            weights = weights.to(dtype=self.dtype)
-
-            embeds = self.pos_embed(indices)
-            embeds *= weights
-            combined = embeds.sum(dim=0)
-
-            combined = combined.reshape(
-                h // m_size, m_size, w // m_size, m_size, hidden_dim
+            # Pack every image before the FP32 reduction. Reducing separately
+            # changes NPU reduction rounding at BF16 midpoint values.
+            order = (
+                torch.arange(h * w, device=self.device)
+                .reshape(h // m_size, m_size, w // m_size, m_size)
+                .permute(0, 2, 1, 3)
+                .flatten()
+                .repeat(t)
             )
-            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
-            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
-            outputs.append(repeated)
+            index_parts.append(indices[:, order])
+            weight_parts.append(weights[:, order])
 
-        return torch.cat(outputs, dim=0)
+        indices = torch.cat(index_parts, dim=1)
+        weights = torch.cat(weight_parts, dim=1)
+        embeds = self.pos_embed(indices)
+        return (embeds.float() * weights).sum(dim=0).to(self.dtype)
 
     def compute_cudnn_batch_offsets_packed(
         self,

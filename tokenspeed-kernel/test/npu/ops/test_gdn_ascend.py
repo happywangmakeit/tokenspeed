@@ -48,11 +48,11 @@ def _reference(q, k, v, g, beta, initial):
     return out, state.transpose(-1, -2)
 
 
-@pytest.mark.parametrize("lengths", [(1,), (3, 0, 4)])
-def test_prefill_matches_reference_and_keeps_requests_isolated(lengths):
+@pytest.mark.parametrize("heads,width", [(2, 8), (16, 128)])
+@pytest.mark.parametrize("lengths", [(1,), (3, 0, 4), (16,), (256,)])
+def test_prefill_matches_reference_and_keeps_requests_isolated(lengths, heads, width):
     torch.manual_seed(13)
     tokens = sum(lengths)
-    heads, width = 2, 8
     q = torch.randn(1, tokens, heads, width, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
@@ -97,9 +97,9 @@ def test_prefill_matches_reference_and_keeps_requests_isolated(lengths):
     )
 
 
-def test_decode_writes_destination_without_changing_source_or_padding():
+@pytest.mark.parametrize("heads,width", [(2, 8), (16, 128)])
+def test_decode_writes_destination_without_changing_source_or_padding(heads, width):
     torch.manual_seed(17)
-    heads, width = 2, 8
     q = torch.randn(2, 1, heads, width, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
@@ -137,3 +137,60 @@ def test_decode_writes_destination_without_changing_source_or_padding():
     torch.testing.assert_close(updated[0], before[0])
     torch.testing.assert_close(updated[1], before[1])
     torch.testing.assert_close(updated[2], expected_state[0], rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize("tokens", [16, 256])
+def test_model_geometry_split_prefill_and_eight_decode_steps(tokens):
+    """Carry real-size state across chunks and eight scheduler-style updates."""
+    torch.manual_seed(20261026)
+    heads, width, steps = 16, 128, 8
+    q = torch.randn(1, tokens + steps, heads, width, dtype=torch.bfloat16) / 4
+    k, v = torch.randn_like(q) / 4, torch.randn_like(q) / 4
+    a = torch.randn(1, tokens + steps, heads, dtype=torch.bfloat16)
+    b = torch.randn_like(a)
+    a_log = torch.randn(heads, dtype=torch.float32) / 4
+    dt_bias = torch.randn(heads, dtype=torch.float32) / 4
+    g = -a_log.exp() * torch.nn.functional.softplus(a.float() + dt_bias)
+    beta = b.float().sigmoid()
+    initial = torch.randn(1, heads, width, width, dtype=torch.float32) / 10
+    expected, expected_state = _reference(q, k, v, g, beta, initial)
+    state = initial.npu()
+    outputs = []
+    for start, end in [(0, tokens // 2), (tokens // 2, tokens)]:
+        result = gdn_chunk_prefill(
+            q[:, start:end].npu(),
+            k[:, start:end].npu(),
+            v[:, start:end].npu(),
+            g[:, start:end].npu(),
+            beta[:, start:end].npu(),
+            scale=width**-0.5,
+            initial_state=state,
+            cu_seqlens=torch.tensor([0, end - start], dtype=torch.int32, device="npu"),
+            qk_l2norm=True,
+        )
+        outputs.append(result.out.cpu())
+        state = result.final_state
+    sentinel = torch.randn_like(state)
+    pool = torch.cat([sentinel, state, sentinel.clone()])
+    protected = pool[[0, 2]].clone()
+    for pos in range(tokens, tokens + steps):
+        out = gdn_decode_step(
+            q[:, pos : pos + 1].npu(),
+            k[:, pos : pos + 1].npu(),
+            v[:, pos : pos + 1].npu(),
+            A_log=a_log.npu(),
+            a=a[:, pos : pos + 1].npu(),
+            dt_bias=dt_bias.npu(),
+            b=b[:, pos : pos + 1].npu(),
+            initial_state=pool,
+            initial_state_indices=torch.tensor([1], dtype=torch.int32, device="npu"),
+            output_state_indices=torch.tensor([1], dtype=torch.int32, device="npu"),
+            scale=width**-0.5,
+            use_qk_l2norm=True,
+        )
+        outputs.append(out.cpu())
+    torch.testing.assert_close(
+        torch.cat(outputs, dim=1).float(), expected, atol=0.002, rtol=0.02
+    )
+    torch.testing.assert_close(pool[1:2].cpu(), expected_state, atol=2e-5, rtol=2e-4)
+    torch.testing.assert_close(pool[[0, 2]], protected, atol=0, rtol=0)

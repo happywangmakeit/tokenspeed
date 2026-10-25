@@ -126,6 +126,28 @@ def _varlen_metadata(
     return cu_seqlens, seq_lens, int(max_seqlen)
 
 
+def vision_attn_torch_eager(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    bsz: int,
+    seq_len: int,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
+    **_: Any,
+) -> torch.Tensor:
+    """Unfused noncausal attention with explicit BF16 rounding boundaries."""
+    from tokenspeed_kernel.ops.attention.mha import vision_eager
+
+    cu_seqlens, _, _ = _varlen_metadata(
+        cu_seqlens, bsz, seq_len, device=q.device, max_seqlen=max_seqlen
+    )
+    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    return vision_eager(q, k, v, cu_seqlens=cu_seqlens, scale=scale)
+
+
 def vision_attn_triton(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -293,6 +315,7 @@ def vision_attn_flashinfer_cudnn(
 
 _BACKENDS: dict[str, Callable[..., torch.Tensor]] = {
     "triton_attn": vision_attn_triton,
+    "torch_eager": vision_attn_torch_eager,
     "fa3": vision_attn_fa3,
     "fa4": vision_attn_fa4,
     "flashinfer_cudnn": vision_attn_flashinfer_cudnn,

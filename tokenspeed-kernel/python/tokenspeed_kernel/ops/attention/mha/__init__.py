@@ -573,3 +573,17 @@ __all__ = [
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
 ]
+
+
+def vision_eager(q, k, v, *, cu_seqlens, scale):
+    """Noncausal packed attention with eager rounding, returning [T,H,D]."""
+    import tokenspeed_kernel.ops.attention.mha.torch_eager  # noqa: F401
+
+    kernel = select_kernel(
+        "attention",
+        "vision_eager",
+        _attention_format_signature(q=q, k=k, v=v),
+        traits={},
+        solution="torch",
+    )
+    return kernel(q, k, v, cu_seqlens=cu_seqlens, scale=scale)
